@@ -1,0 +1,868 @@
+#import measure
+from tkinter import*
+import hashlib
+import binascii
+import random
+import hmac
+from math import ceil
+from Crypto.Cipher import AES
+from PIL import ImageTk, Image
+rng = random.SystemRandom()
+mask_remove_bit = 0b11111110
+bit_3_mask = 0b111
+import tkinter.messagebox
+from tkinter import Tk, Label, Button, StringVar, W, E, filedialog, ttk
+from skimage.measure import compare_psnr,compare_mse
+import cv2
+import PIL.Image, PIL.ImageTk
+
+class HMACMismatch(Exception):
+    pass
+	
+class FileWillNotFit(Exception):
+    pass
+
+def init_key_generation(keylengthbits):
+	#Generate key in hex, for legacy format.
+    if keylengthbits < 8:
+        keylengthbits = 8
+    elif keylengthbits % 8 != 0:
+        keylengthbits += ( 8 - keylengthbits % 8)
+    key = []
+    iters = keylengthbits // 8
+    for i in range(0,iters):
+        key.append(format(rng.randint(0,255), '02x'))
+    return "".join(key)
+	
+def create_random_key(length):
+	#Generate key in bytearray.
+    rng = random.SystemRandom()
+    vtr = bytearray()
+    for i in range(0,length):
+        vtr.append(rng.randint(0,255))
+    return vtr
+	
+def do_xor_on_hex(str1,str2):
+    l1 = len(str1)
+    if l1 != len(str2) or l1 % 2 != 0:
+        print("ERROR!")
+        return "Error"
+    xor = []
+    for i in range(0,l1,2):
+        xor.append(format(int(str1[i:i+2],16)^int(str2[i:i+2],16),"02x"))
+    return "".join(xor)
+	
+def do_xor_on_bytes(bs1,bs2):
+    l1 = len(bs1)
+    if l1 != len(bs2):
+        print("ERROR!")
+        return "Error"
+    xor = bytearray()
+    for i in range(0,l1):
+        xor.append(bs1[i] ^ bs2[i])
+    return xor
+
+def hex_transpose(hexstr):
+	#Transpose used for custom SHA-512 stream cipher
+    v1 = 0
+    newhex = []
+    hexlen = len(hexstr)
+    for i in range(0,hexlen,2):
+        newhex.append(hexstr[i+1] + hexstr[i])
+    newhex2 = newhex[(hexlen//4):] + newhex[0:(hexlen//4)]
+    print(newhex2)
+    return "".join(newhex2)
+	
+def byte_transpose(binarr):
+	#Transpose used for custom SHA-512 stream cipher
+    binarrlen = len(binarr)
+    newbin = bytearray()
+    for i in range(0,binarrlen,2):
+        newbin.append(binarr[i+1])
+        newbin.append(binarr[i])
+    newbin2 = newbin[(binarrlen//2):] + newbin[:(binarrlen//2)]
+    return newbin2
+		
+def int_to_big_endian(intg, pad_to=16):
+    m_big = 0b11111111
+    big_endian_int = bytearray()
+    times_to_iterate = ceil(len(bin(intg)[2:])/8)
+    for i in range(0,times_to_iterate):
+        big_endian_int.append((intg >> (i*8)) & m_big)
+    while len(big_endian_int) < pad_to:
+        big_endian_int.append(0)
+    big_endian_int.reverse()
+    return big_endian_int
+
+def big_endian_to_int(big_endian_barr):
+    big_endian = big_endian_barr
+    cur_num = 0
+    for i in range(0,len(big_endian)):
+        cur_num = (cur_num << 8) | big_endian[i]
+    return cur_num
+	
+def bytes_to_3_bit_chunks(bytearr):
+    des_int = big_endian_to_int(bytearr)
+    #print('des_int', des_int)
+    i_list = []
+    for i in range(0,8):
+        i_list.append(des_int & bit_3_mask)
+        des_int >>= 3
+    i_list.reverse()
+    return i_list
+
+def bit_3_chunks_to_bytes(chunks):
+    int_des = 0
+    for i in range(0,8):
+        int_des <<= 3
+        int_des |= chunks[i]
+    return int_to_big_endian(int_des, pad_to=3)
+    print('int_des', int_des)
+
+def create_key_xor_mask(salt,password):
+	#USE 2M ITERS!
+    xor_mask = hashlib.pbkdf2_hmac('sha512',password.encode(),salt,4000000)
+    return xor_mask
+
+def input_int_until_list_or_default(list_desired, default_val):
+    is_done = False
+    while is_done == False:
+        try:
+            tv = int(input())
+            if tv in list_desired:
+                is_done = True
+            else:
+                print('Incorrect Value')
+        except ValueError:
+            tv = default_val
+            is_done = True
+    return tv
+	
+def input_file_until_file_found():
+	is_done = False
+	while is_done == False:
+		tv = input()
+		try:
+			f = open(tv,'r')
+			is_done = True
+		except FileNotFoundError:
+			print('File not found')
+	return tv
+
+class sha512_efb(object):
+    def __init__(self, init_key):
+        self.current_key = bytearray.fromhex(init_key)
+        self.current_feedback = bytearray(hashlib.sha512(self.current_key).digest())
+    def get_bytes_to_xor(self):
+        self.current_key = self.current_key[-1:]+self.current_key[:-1]
+        self.current_thing_to_hash = self.current_feedback+self.current_key
+        self.current_feedback = bytearray(hashlib.sha512(self.current_thing_to_hash).digest())
+        self.current_output_bytes = bytearray(hashlib.sha512(byte_transpose(self.current_thing_to_hash)).digest())
+        return self.current_output_bytes
+
+class aes256_ede3_ctr(object):
+		#key must be 1024 bit
+    def __init__(self,init_key,mode="HEX"):
+        if mode == "HEX":
+            bytes_init_key = bytearray.fromhex(init_key)
+        elif mode == "BYTES":
+            bytes_init_key = bytearray(init_key)
+        k1 = bytes_init_key[:32]
+        k2 = bytes_init_key[32:64]
+        k3 = bytes_init_key[64:96]
+        k4 = bytes_init_key[96:128]
+        aes_first = hashlib.sha256(k1+k4).digest()
+        aes_second = hashlib.sha256(k2+k4).digest()
+        aes_third = hashlib.sha256(k3+k4).digest()
+        self.first_aes = AES.new(aes_first,AES.MODE_ECB)
+        self.second_aes = AES.new(aes_second,AES.MODE_ECB)
+        self.third_aes = AES.new(aes_third,AES.MODE_ECB)
+        aes_iv = hashlib.md5(hashlib.sha256(hashlib.sha512(k1+k2+k3+k4).digest()).digest()).digest()
+		#print('K1:',list(aes_first))
+		#print('K2:',list(aes_second))
+		#print('K3:',list(aes_third))
+		#print('IV:',list(aes_iv))
+        self.to_encrypt = big_endian_to_int(aes_iv)
+    def get_bytes_to_xor(self):
+        bytes_to_xor = bytearray()
+        for i in range(0,4):
+            cur_bytes_to_encrypt = bytes(int_to_big_endian(self.to_encrypt))
+            self.to_encrypt = (self.to_encrypt + 1) % (2**128)
+			#print(list(cur_bytes_to_encrypt))
+            e1 = self.first_aes.encrypt(cur_bytes_to_encrypt)
+            e2 = self.second_aes.decrypt(e1)
+            e3 = self.third_aes.encrypt(e2)
+            bytes_to_xor.extend(e3)
+        return bytes_to_xor
+	
+def force_integer_input(des_str):
+    cor_key = False
+    while cor_key == False:
+        try:
+            ipt = int(input(des_str))
+            cor_key = True
+        except ValueError:
+            print("Try again.")
+    return ipt
+
+def generateHash(filename):
+    with open(filename, 'rb') as f:
+        content = f.read()
+        # SHA-512
+        sha512 = hashlib.sha512(content).hexdigest()
+        print('hash value:',sha512)
+    return {'sha512':sha512}
+        
+def write_to_image(barr_to_write,image_original,image_to_write):
+    orig_matrix = image_original.load()
+    #print('orig_matrix', orig_matrix)
+    sw, sh = image_to_write.size
+    #print('sw, sh', sw, sh)
+    image_to_write_matrix = image_to_write.load()
+    #print('matriks1:', image_to_write_matrix)
+    imgp = sw * sh
+    #print('imgp:', imgp)
+    imgb = imgp * 3
+    #print('imgb', imgb)
+    cur_w = cur_h = 0
+    #print('curw, curh', cur_w, cur_h)
+    is_full = False
+    for i in range(0,len(barr_to_write)//3):
+        cur_chunk = barr_to_write[i*3:(i*3)+3]
+        #print('cur_chunk', cur_chunk)
+        cur_list = bytes_to_3_bit_chunks(cur_chunk)
+        #print('cur_list', cur_list)
+        for int3 in cur_list:
+            r,g,b = orig_matrix[cur_w,cur_h]
+            #print('rgb1', r,g,b)
+            r,g,b = r & mask_remove_bit, g & mask_remove_bit, b & mask_remove_bit
+            #print('rgb2', r,g,b)
+            bit_r, bit_g, bit_b = int3 & 0b1, (int3 >> 1) & 0b1, (int3 >> 2) & 0b1
+            #print('bitr, bitg, bitb', bit_r, bit_g, bit_b)
+            nr,ng,nb = r | bit_r, g | bit_g, b | bit_b
+            #print('nr, ng, nb', nr, ng, nb)
+            image_to_write_matrix[cur_w,cur_h] = nr, ng, nb
+            #print('image to write:', image_to_write_matrix[cur_w,cur_h])
+            cur_w += 1
+            if cur_w % sw == 0:
+                cur_h += 1
+                cur_w = 0
+                if cur_h == sh:
+                    is_full = True
+    print('Image will be extra padded:',not is_full)
+    while is_full == False:
+        int3 = rng.randint(0,7)
+        #print('int3', int3)
+        r,g,b = orig_matrix[cur_w,cur_h]
+        #print('rgb3', r,g,b)
+        r,g,b = r & mask_remove_bit, g & mask_remove_bit, b & mask_remove_bit
+        #print('rgb4', r,g,b)
+        bit_r, bit_g, bit_b = int3 & 0b1, (int3 >> 1) & 0b1, (int3 >> 2) & 0b1
+        nr,ng,nb = r | bit_r, g | bit_g, b | bit_b
+        image_to_write_matrix[cur_w,cur_h] = nr, ng, nb
+        #print('image to write:', image_to_write_matrix[cur_w,cur_h])
+        cur_w += 1
+        if cur_w % sw == 0:
+            cur_h += 1
+            cur_w = 0
+            if cur_h == sh:
+                is_full = True
+    print('Image completely padded:',is_full)
+    return image_to_write
+	
+def read_from_image(image_to_read):
+    sw, sh = image_to_read.size
+    image_to_read_matrix = image_to_read.load()
+    av_bits = sw*sh*3
+    av_bytes = av_bits // 8
+    tti = av_bytes // 3
+    cur_w = cur_h = 0
+    out_array = bytearray()
+    for i in range(0,tti):
+        cur_list = []
+        for j in range(0,8):
+            r,g,b = image_to_read_matrix[cur_w,cur_h]
+            bit_r, bit_g, bit_b = r & 0b1, g & 0b1, b & 0b1
+            cur_chk = bit_b
+            cur_chk = (cur_chk << 1) | bit_g
+            cur_chk = (cur_chk << 1) | bit_r
+            cur_list.append(cur_chk)
+            cur_w += 1
+            if cur_w % sw == 0:
+                cur_h += 1
+                cur_w = 0
+        out_array.extend(bit_3_chunks_to_bytes(cur_list))
+    return out_array
+	
+def encrypt_image(prov_password, prov_orig_name, prov_file_name, prov_new_name):
+    save_object, save_name, img_object = encrypt_image_buffer(prov_password, prov_orig_name, prov_file_name, prov_new_name)
+    
+    save_object.save(save_name,format="PNG")
+    save_object.close()
+    img_object.close()
+    
+def encrypt_image_buffer(prov_password, prov_orig_name, prov_file_name, prov_new_name):
+    img_name = prov_orig_name
+    img_object = Image.open(img_name)
+    img_object = img_object.convert('RGB')
+    print('img_object', img_object)
+    size_w,size_h = img_object.size
+    print('sizew, sizeh', size_w, size_h)
+    image_pixels = size_w*size_h
+    print('image_pixels', image_pixels)
+		# Method 1:
+		# 1 bit per color, so 3 bits per pixel
+		# 3*8 = 24, so we'll take 8 pixels per 3 bytes.
+    avail_bits = image_pixels * 3
+    print('avail_bits', avail_bits)
+    bits_to_pad = avail_bits % 24
+    avail_bytes = (avail_bits // 8)
+    print('avail_bytes', avail_bytes)
+    print('We can fit',avail_bytes-384,'bytes in the image selected.')
+    print('Actually there are',avail_bytes,'available')
+    file_name = prov_file_name
+    print('filename', file_name)
+    pass_to_use = prov_password
+    fte = open(file_name,'rb')
+    fte_r = bytearray(fte.read())
+    #print('fter', fte_r)
+    fte_r_l = len(fte_r)
+    fte.close()
+    print('Your file length is:',fte_r_l,'bytes')
+    if fte_r_l > avail_bytes:
+        raise FileWillNotFit
+    save_name = prov_new_name
+    print('savename', save_name)
+    save_object = Image.new('RGB',img_object.size)
+    bytearray_to_save = bytearray()
+    print('bytearray', bytearray_to_save)
+    salt_1 = create_random_key(64)
+    key_1 = create_random_key(64)
+    xor_1 = create_key_xor_mask(salt_1,pass_to_use)
+    ekey_1 = do_xor_on_bytes(key_1,xor_1)
+    bytearray_to_save.extend(salt_1)
+    bytearray_to_save.extend(ekey_1)
+    salt_2 = create_random_key(64)
+    key_2 = create_random_key(64)
+    xor_2 = create_key_xor_mask(salt_2,pass_to_use)
+    ekey_2 = do_xor_on_bytes(key_2,xor_2)
+    bytearray_to_save.extend(salt_2)
+    bytearray_to_save.extend(ekey_2)
+    key_to_use = (key_1+key_2)
+    crypto_object = aes256_ede3_ctr(key_to_use, mode="BYTES")
+    bytearray_to_encrypt = bytearray()
+    bytearray_to_encrypt.extend(int_to_big_endian(fte_r_l,pad_to=64))
+    bytearray_to_encrypt.extend(fte_r)
+    len_barr = len(bytearray_to_encrypt)
+    timestopad = 64-(len_barr%64)
+    for i in range(0,timestopad):
+        bytearray_to_encrypt.append(rng.randint(0,255))
+    timestoencrypt = len(bytearray_to_encrypt) // 64
+    for i in range(0,timestoencrypt):
+        cc = bytearray_to_encrypt[(i*64):(i*64)+64]
+        cbx = crypto_object.get_bytes_to_xor()
+        ce = do_xor_on_bytes(cc,cbx)
+        bytearray_to_save.extend(ce)
+    bytestopad = avail_bytes - (len(bytearray_to_save)+64)
+    for i in range(0,bytestopad):
+        bytearray_to_save.append(rng.randint(0,255))
+#    yhmackey_enc = hashlib.sha512(bytearray(hashlib.sha512(key_to_use).digest())+bytearray(hashlib.sha256(key_to_use).digest())+bytearray(hashlib.md5(key_to_use).digest())).digest()
+#    f_hash = hmac.new(hmackey_enc,msg=bytearray_to_save,digestmod=hashlib.sha512).digest()
+#    bytearray_to_save.extend(f_hash)
+    return write_to_image(bytearray_to_save,img_object,save_object), save_name, img_object
+    
+	
+def decrypt_image(prov_password, prov_orig_name, prov_file_name):
+    img_name = prov_orig_name
+    pass_to_use = prov_password
+    file_name = prov_file_name
+    img_object = Image.open(img_name)
+    read_bytearray = read_from_image(img_object)
+    #print('readbytearry', read_bytearray)
+    s1 = read_bytearray[:64]
+    ek1 = read_bytearray[64:128]
+    s2 = read_bytearray[128:192]
+    ek2 = read_bytearray[192:256]
+    xor1 = create_key_xor_mask(s1,pass_to_use)
+    xor2 = create_key_xor_mask(s2,pass_to_use)
+    k1 = do_xor_on_bytes(ek1,xor1)
+    k2 = do_xor_on_bytes(ek2,xor2)
+    key_to_use = k1+k2
+    hmackey_enc = hashlib.sha512(bytearray(hashlib.sha512(key_to_use).digest())+bytearray(hashlib.sha256(key_to_use).digest())+bytearray(hashlib.md5(key_to_use).digest())).digest()
+    hmac_array = read_bytearray[-64:]
+    f_hash = hmac.new(hmackey_enc,msg=read_bytearray[:-64],digestmod=hashlib.sha512).digest()
+    hmac_valid = False
+    hmac_override = False
+#    if hmac.compare_digest(f_hash,hmac_array) == True:
+    if True:
+        hmac_valid = True
+    else:
+        print("-------------WARNING----------------")
+        print("------------------------------------")
+        print("------------------------------------")
+        print("HMAC MISMATCH, FILE COULD BE ALTERED")
+        print("------------------------------------")
+        print("------------------------------------")
+#        print("-------------WARNING----------------")
+#    print("HMAC CALC:",bytes.decode(binascii.hexlify(f_hash)))
+#    print("HMAC READ:",bytes.decode(binascii.hexlify(read_bytearray[-64:])))
+    if hmac_valid == True:
+#        print()
+#        hov = input("Press 'Y' to override")
+#        if hov == 'Y' or hov == 'y':
+            hmac_override = True
+    if hmac_valid == True or hmac_override == True:
+        crypto_object = aes256_ede3_ctr(key_to_use, mode="BYTES")
+        xor_len = crypto_object.get_bytes_to_xor()
+        barr_len = do_xor_on_bytes(read_bytearray[256:320],xor_len)
+        int_len = big_endian_to_int(barr_len)
+        timestopad = 64-(int_len%64)
+        decrypt_bytearray = read_bytearray[320:320+int_len+timestopad]
+        file_bytearray = bytearray()
+        ttd = len(decrypt_bytearray) // 64
+        for i in range(0,ttd):
+            cc = decrypt_bytearray[(i*64):(i*64)+64]
+            cbx = crypto_object.get_bytes_to_xor()
+            ce = do_xor_on_bytes(cc,cbx)
+            file_bytearray.extend(ce)
+        file_bytearray = file_bytearray[0:int_len]
+        file_object_save = open(file_name,'wb')
+        file_object_save.write(file_bytearray)
+        file_object_save.close()
+    
+def messagebox():
+    tkinter.messagebox.showinfo("About Me", "U DED")
+
+class Welcome():
+    
+    def __init__(self,master):
+        
+        self.master=master
+        #self.master.geometry('400x300+100+300')
+        self.master.title('STEGO')
+        
+        self.lavel1=Label(self.master,text='MENU :',font="Times 20").grid(row=1,column=2)
+        self.button1=Button(self.master,text='1.EMBED',fg='white',font="Times 20", bg="#990033",height = 1, width = 14, command=self.gotoEmbed).grid(row=3,column=2)
+        self.button2=Button(self.master,text='2.EKSTRACT',fg='#990033',bg='white',font="Times 20",height = 1, width = 14, command=self.gotoEkstract).grid(row=4,column=2)
+        #self.button3=Button(self.master,text='UJI',fg='blue', command=self.gotoUji).grid(row=2,column=4)
+        #self.button4=Button(self.master,text='QUIT',fg='red', command=self.finish).grid(row=2,column=5)
+        
+    def gotoEmbed(self):
+        
+        root2=Toplevel(self.master)
+        myGUI=Embed(root2)
+        
+    def gotoEkstract(self):
+        
+        root2=Toplevel(self.master)
+        myGUI=Ekstract(root2)
+        
+    def gotoUji(self):
+        
+        root2=Toplevel(self.master)
+        myGUI=Uji(root2)
+        
+    def finish(self):
+        self.master.destroy()
+        
+class Embed():
+    
+    def __init__(self, master):
+        
+        self.master = master
+        master.title("Image Steganografi")
+
+        self.filecover = "..."
+        self.filedoc = "..."
+        self.filepass = "..."
+        self.PSNR = "..."
+        self.MSE = "..."
+
+        self.filename_label_text = StringVar()
+        self.filename_label_text.set(self.filecover)
+        self.filename_labelcover = Label(self.master, textvariable=self.filename_label_text)
+        
+        self.filename_label_text1 = StringVar()
+        self.filename_label_text1.set(self.filedoc)
+        self.filename_labeldoc = Label(self.master, textvariable=self.filename_label_text1)
+        
+        self.filename_label_text2 = StringVar()
+        self.filename_label_text2.set(self.filepass)
+        self.filename_labelpass = Label(self.master, textvariable=self.filename_label_text2)
+        
+        self.PSNR_label = StringVar()
+        self.PSNR_label.set(self.PSNR)
+        self.PSNR_label = Label(self.master, textvariable=self.PSNR)
+        
+        self.PSNR_label = StringVar()
+        self.PSNR_label.set(self.MSE)
+        self.PSNR_label = Label(self.master, textvariable=self.MSE)
+        
+        self.title_filename_label1 = Label(self.master, text="Filecover:")
+        self.title_filename_label2 = Label(self.master, text="Filedoc:")
+        self.title_filename_label3 = Label(self.master, text="Filepass:")
+        self.title_filename_label4 = Label(self.master, text="New Name:")
+        self.title_filename_label5 = Label(self.master, text="Cover Image:")
+        self.title_filename_label6 = Label(self.master, text="Pass Image:")
+        self.title_filename_label7 = Label(self.master, text="New Image:")
+        self.canvascover = Canvas(master, height= 300, width=300, bg="white" )
+        self.canvaspass = Canvas(master, height= 300, width=300, bg="white" )
+        self.canvasnew = Canvas(master, height= 300, width=300, bg="white" )
+        self.PSNR_label = Label(self.master)
+        self.PSNR_labeltext = Label(self.master, text="PSNR:")
+        self.MSE_label = Label(self.master)
+        self.MSE_labeltext = Label(self.master, text="MSE:")
+
+        self.browse_buttoncover = Button(self.master, text="Browse cover...",fg="#333366",bg='white',height = 1, width = 14, command=lambda: self.update("browse"))
+        self.browse_buttondoc = Button(self.master, text="Browse doc...",fg="#333366",bg='white',height = 1, width = 14,state=DISABLED, command=lambda: self.update1("browse"))
+        self.browse_buttonpass = Button(self.master, text="Browse pass...",fg="#333366",bg='white',state=DISABLED,height = 1, width = 14, command=lambda: self.update2("browse"))
+        self.inputBox = Entry(self.master, width=50)
+        self.embed_button = Button(self.master, text="Embed",fg="#990033", state=DISABLED, command=lambda: self.update3("embed"))
+        self.pengujian_button = Button(self.master, text="Pengujian",fg="#990033", command=lambda: self.update4("pengujian"))
+        self.reset_button = Button(self.master, text="Reset",fg="#990033", command=lambda: self.update("reset"))
+        self.progress_bar = ttk.Progressbar(self.master, orient ='horizontal', length =200, mode = 'determinate')
+        
+
+        # Layout
+        self.title_filename_label1.grid(row=1, column=0, sticky=W)
+        self.title_filename_label2.grid(row=2, column=0, sticky=W)
+        self.title_filename_label3.grid(row=3, column=0, sticky=W)
+        self.title_filename_label4.grid(row=4, column=0, sticky=W)
+        self.browse_buttoncover.grid(row=1, column=4, sticky=E)
+        self.browse_buttondoc.grid(row=2, column=4, sticky=E)
+        self.browse_buttonpass.grid(row=3, column=4, sticky=E)
+        self.filename_labelcover.grid(row=1, column=1, columnspan=2, sticky=W)
+        self.filename_labeldoc.grid(row=2, column=1, columnspan=2, sticky=W)
+        self.filename_labelpass.grid(row=3, column=1, columnspan=2, sticky=W)
+        self.inputBox.grid(row=4, column=1, sticky=W)
+        self.embed_button.grid(row=5, column=0, columnspan=3, sticky=W+E)
+        self.reset_button.grid(row=5, column=4, sticky=W+E)
+        self.title_filename_label5.grid(row=6, column=0, sticky=W)
+        self.title_filename_label6.grid(row=6, column=1, sticky=W)
+        self.title_filename_label7.grid(row=6, column=2, sticky=W)
+        self.canvascover.grid(row=7, column=0, sticky=W)
+        self.canvaspass.grid(row=7, column=1, sticky=W)
+        self.canvasnew.grid(row=7, column=2, sticky=W)
+        self.pengujian_button.grid(row=8, column=0, columnspan=2, sticky=W+E)
+        self.PSNR_label.grid(row=8, column=3, sticky=W)
+        self.PSNR_labeltext.grid(row=8, column=2, sticky=W)
+        self.MSE_label.grid(row=9, column=3, sticky=W)
+        self.MSE_labeltext.grid(row=9, column=2, sticky=W)
+#        self.progress_bar.grid(row=10, column =0, pady = 10)
+
+    def update(self, method):
+        if method == "browse":
+            #self.clearFields()
+            root = Tk()
+            file = filedialog.askopenfile(parent=root, mode='rb', title='Choose a file')
+            if file != None:
+                self.filecover = file.name
+                self.filename_label_text.set(self.filecover)
+            root.withdraw()
+            self.browse_buttondoc.config(state='normal')
+#            self.imgcover = cv2.cvtColor(cv2.imread(self.filecover), cv2.COLOR_BGR2RGB)
+#            height, width, no_channels = self.imgcover.shape
+#            self.imgcover = cv2.resize(self.imgcover, (300,300), interpolation=cv2.INTER_CUBIC)
+#            self.filename = PIL.ImageTk.PhotoImage(image = PIL.Image.fromarray(self.imgcover))
+            self.imgcover = Image.open(self.filecover)
+            self.imgcover = self.imgcover.resize((300,300), Image.ANTIALIAS)
+            self.filename = ImageTk.PhotoImage(self.imgcover)
+            self.canvascover.create_image(0,0, image = self.filename, anchor=NW)
+            return self.filename
+
+        else: # reset
+            self.clearFields()
+
+    def update1(self, method):
+        if method == "browse":
+            #self.clearFields()
+            root = Tk()
+            file = filedialog.askopenfile(parent=root, mode='rb', title='Choose a file')
+            if file != None:
+                self.filedoc = file.name
+                self.filename_label_text1.set(self.filedoc)
+            root.withdraw()
+            self.browse_buttonpass.config(state='normal') 
+            
+            tkinter.messagebox.showinfo("proses", "dokumen sudah di input")
+            
+
+        else: # reset
+            self.clearFields()
+
+    def update2(self, method):
+        if method == "browse":
+            #self.clearFields()
+            root = Tk()
+            file = filedialog.askopenfile(parent=root, mode='rb', title='Choose a file')
+            if file != None:
+                self.filepass = file.name
+                self.filename_label_text2.set(self.filepass)
+            root.withdraw()
+            self.embed_button.config(state='normal')   
+#            self.imgpass = cv2.cvtColor(cv2.imread(self.filepass), cv2.COLOR_BGR2RGB)
+#            height, width, no_channels = self.imgcover.shape
+#            self.imgpass = cv2.resize(self.imgpass, (300,300), interpolation=cv2.INTER_CUBIC)
+#            self.filenamepass = PIL.ImageTk.PhotoImage(image = PIL.Image.fromarray(self.imgpass))
+            self.imgpass = Image.open(self.filepass)
+            self.imgpass = self.imgpass.resize((300,300), Image.ANTIALIAS)
+            self.filenamepass = ImageTk.PhotoImage(self.imgpass)
+            self.canvaspass.create_image(0,0, image = self.filenamepass, anchor=NW)
+            return self.filenamepass
+            
+
+        else: # reset
+            self.clearFields()
+            
+
+    def update3(self, method):
+        
+        if method == "embed":
+
+            op_in = self.filecover
+            op_fte = self.filedoc
+            op_dest = self.inputBox.get()
+            temp = generateHash(self.filepass)
+            op_passw = temp['sha512']
+            
+            #encrypt_image(op_passw, op_in, op_fte, op_dest)
+            save_object, save_name, img_object = encrypt_image_buffer(op_passw, op_in, op_fte, op_dest)
+            save_object.save(save_name,format="PNG")
+            save_object.close()
+            img_object.close()
+            
+            self.stegofile = save_name
+            
+            self.imghasil = cv2.cvtColor(cv2.imread(save_name), cv2.COLOR_BGR2RGB)
+            height, width, no_channels = self.imghasil.shape
+            self.imghasil = cv2.resize(self.imghasil, (300,300), interpolation=cv2.INTER_CUBIC)
+            self.filenamehasil = PIL.ImageTk.PhotoImage(image = PIL.Image.fromarray(self.imghasil))
+#            self.imgnew = Image.open(save_name)
+#            self.imgnew = self.imgnew.resize((300,300), Image.ANTIALIAS)
+#            self.filename1 = ImageTk.PhotoImage(self.imgnew)
+            self.canvasnew.create_image(0,0, image = self.filenamehasil, anchor=NW)
+            
+            tkinter.messagebox.showinfo("proses", "DONE")
+            return self.filenamehasil
+            
+#            img1 = self.filename
+#            img2 = self.
+            
+        else: # reset
+            self.clearFields()
+            
+    def update4(self, method):
+        if method == "pengujian":
+            #root = Tk()
+            self.img1 = cv2.imread(self.stegofile)
+            #height, width, no_channels = self.imgl.shape
+            self.img2 = cv2.imread(self.filecover)
+            #height, width, no_channels = self.img2.shape
+            ujipsnr = compare_psnr(self.img1,self.img2)
+            ujimse = compare_mse(self.img1,self.img2)
+#            self.PSNR = ['PSNR']
+            self.PSNR_label.config(text=ujipsnr)
+            self.MSE_label.config(text=ujimse)
+            #msehasil = compare_mse(ref_img,noisy_img)
+            #return self.PSNR
+            
+        else:
+            self.clearFields() 
+            
+            
+    def clearFields(self):
+        self.filename = "..."
+        self.filename_label_text.set(self.filename)
+        
+    def myquit(self):
+        self.master.destroy()
+        
+
+        
+class Ekstract():
+    
+    def __init__(self, master):
+#        tk.Frame.__init__(self, master)
+#        self.controller = controller
+#        label = tk.Label(self, text="This is page 2", font=controller.title_font)
+#        label.pack(side="top", fill="x", pady=10)
+#        button = tk.Button(self, text="Go to the start page", command=lambda: controller.show_frame("StartPage"))
+#        button.pack()
+        
+        self.master = master
+        master.title("Image Steganografi")
+
+        self.filecover = "..."
+        self.filedoc = "..."
+        self.filepass = "..."
+        self.sha512hash = "..."
+       # self.createCanvasImage()
+         
+
+
+        self.filename_label_text = StringVar()
+        self.filename_label_text.set(self.filecover)
+        self.filename_labelcover = Label(master, textvariable=self.filename_label_text)
+        
+        #self.filename_label_text1 = StringVar()
+        #self.filename_label_text1.set(self.filedoc)
+        #self.filename_labeldoc = Label(master, textvariable=self.filename_label_text1)
+        
+        self.filename_label_text2 = StringVar()
+        self.filename_label_text2.set(self.filepass)
+        self.filename_labelpass = Label(master, textvariable=self.filename_label_text2)
+        
+        #self.sha512hash_label_text = StringVar()
+        #self.sha512hash_label_text.set(self.sha512hash)
+        #self.sha512hash_label = Label(master, textvariable=self.sha512hash_label_text)
+        
+        self.title_filename_label1 = Label(master, text="Filecover:")
+        #self.title_filename_label2 = Label(master, text="Filedoc:")
+        self.title_filename_label3 = Label(master, text="Filepass:")
+        self.title_filename_label4 = Label(master, text="New File:")
+        self.title_filename_label5 = Label(master, text="Cover Image:")
+        self.title_filename_label6 = Label(master, text="Pass Image:")
+        self.canvascover = Canvas(master, height= 300, width=300, bg="white" )
+        self.canvaspass = Canvas(master, height= 300, width=300, bg="white" )
+        #self.title_sha512hash_label = Label(master, text="SHA-512 Hash:")
+
+
+        self.browse_buttoncover = Button(master, text="Browse cover...",fg="#333366",bg='white',height = 1, width = 14, command=lambda: self.update("browse"))
+        #self.browse_buttondoc = Button(master, text="Browse doc...",state=DISABLED, command=lambda: self.update1("browse"))
+        self.browse_buttonpass = Button(master, text="Browse pass...",fg="#333366",bg='white',height = 1, width = 14, state=DISABLED, command=lambda: self.update2("browse"))
+        self.inputBox = Entry(master, width=50)
+        self.embed_button = Button(master, text="Ekstract",state=DISABLED, command=lambda: self.update3("extract"))
+        self.reset_button = Button(master, text="Reset", command=lambda: self.update("reset"))
+        
+        
+
+        # Layout
+        self.title_filename_label1.grid(row=1, column=0, sticky=W)
+        #self.title_filename_label2.grid(row=2, column=0, sticky=W)
+        self.title_filename_label3.grid(row=3, column=0, sticky=W)
+        self.title_filename_label4.grid(row=4, column=0, sticky=W)
+        self.browse_buttoncover.grid(row=1, column=4, sticky=E)
+        #self.browse_buttondoc.grid(row=2, column=4, sticky=E)
+        self.browse_buttonpass.grid(row=3, column=4, sticky=E)
+        self.filename_labelcover.grid(row=1, column=1, columnspan=3, sticky=W)
+        #self.filename_labeldoc.grid(row=2, column=1, columnspan=3, sticky=W)
+        self.filename_labelpass.grid(row=3, column=1, columnspan=3, sticky=W)
+        self.inputBox.grid(row=4, column=1,columnspan=2, sticky=W)
+        self.embed_button.grid(row=5, column=0, columnspan=4, sticky=W+E)
+        self.reset_button.grid(row=5, column=4, sticky=W+E)
+        self.title_filename_label5.grid(row=6, column=0, sticky=W)
+        self.title_filename_label6.grid(row=6, column=1, sticky=W)
+        self.canvascover.grid(row=7, column=0, sticky=W)
+        self.canvaspass.grid(row=7, column=1, sticky=W)
+#        self.frame1 = tk.Frame(self.root, width=500, height=400, bd=2)
+#        self.frame1.grid(row=1, column=0)
+##        self.frame2 = tk.Frame(self.root, width=500, height=400, bd=1)
+##        self.frame2.grid(row=1, column=1)
+#
+#        self.cv1 = tk.Canvas(self.frame1, height=390, width=490, background="white", bd=1, relief=tk.RAISED)
+#        self.cv1.grid(row=1,column=0)
+#        self.cv2 = tk.Canvas(self.frame2, height=390, width=490, bd=2, relief=tk.SUNKEN)
+#        self.cv2.grid(row=1,column=0)
+        #self.cv.grid(row=7, column= 2, stickey=W)
+        #self.frame.grid(row=5, column=0)
+         
+        
+        #self.title_sha512hash_label.grid(row=7, column=0, sticky=W)
+        #self.sha512hash_label.grid(row=7, column=1, columnspan=4, sticky=W)
+    def update(self, method):
+        if method == "browse":
+            #self.clearFields()
+            root = Tk()
+            file = filedialog.askopenfile(parent=root, mode='rb', title='Choose a file')
+            if file != None:
+                self.filecover = file.name
+                self.filename_label_text.set(self.filecover)
+            root.withdraw()
+            self.browse_buttonpass.config(state='normal')
+            #image1 = self.filecover
+            self.imgcover = Image.open(self.filecover)
+            self.imgcover = self.imgcover.resize((300,300), Image.ANTIALIAS)
+            self.filename = ImageTk.PhotoImage(self.imgcover)
+            self.canvascover.create_image(0,0, image = self.filename, anchor=NW)
+            
+
+        else: # reset
+            self.clearFields()
+
+    #def update1(self, method):
+        #if method == "browse":
+         #   self.clearFields()
+         #   root = Tk()
+         #   file = filedialog.askopenfile(parent=root, mode='rb', title='Choose a file')
+         #   if file != None:
+         #       self.filedoc = file.name
+         #       self.filename_label_text1.set(self.filedoc)
+         #   root.withdraw()
+         #   self.browse_buttonpass.config(state='normal') 
+            
+
+        #else: # reset
+         #   self.clearFields()
+
+    def update2(self, method):
+        if method == "browse":
+            #self.clearFields()
+            root = Tk()
+            file = filedialog.askopenfile(parent=root, mode='rb', title='Choose a file')
+            if file != None:
+                self.filepass = file.name  
+                self.filename_label_text2.set(self.filepass)
+            root.withdraw()
+            self.embed_button.config(state='normal') 
+            self.imgpass = Image.open(self.filepass)
+            self.imgpass = self.imgpass.resize((300,300), Image.ANTIALIAS)
+            self.filenamee = ImageTk.PhotoImage(self.imgpass)
+            self.canvaspass.create_image(0,0, image = self.filenamee, anchor=NW)
+
+        else: # reset
+            self.clearFields()
+            
+
+    def update3(self, method):
+        
+        if method == "extract":
+
+            op_in = self.filecover
+            #op_fte = self.filedoc
+            op_fte = self.inputBox.get()
+            temp = generateHash(self.filepass)
+            op_passw = temp['sha512']
+            
+            decrypt_image(op_passw, op_in, op_fte)
+            tkinter.messagebox.showinfo("proses", "DONE")
+            
+        else: # reset
+            self.clearFields()
+        
+    def clearFields(self):
+        self.filename = "..."
+        self.filename_label_text.set(self.filename)
+        self.filename = "..."
+        self.filename_label_text.set(self.filename)
+      
+        
+def main():
+    
+    root=Tk()
+    myGUIWelcome=Welcome(root)
+    menu = Menu(root)
+    root.config(menu=menu)
+    
+    subMenu = Menu(menu)
+    menu.add_cascade(label="File", menu=subMenu)
+    #subMenu.add_command(label="exit", command=quit)
+    
+    optionMenu = Menu(menu)
+    menu.add_cascade(label="Help", menu=optionMenu)
+    optionMenu.add_command(label="About", command=messagebox)
+    root.title("Image Steganografi")
+    root.geometry("220x180")
+    root.mainloop()
+    
+if __name__ == '__main__':
+    main()
